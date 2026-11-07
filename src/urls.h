@@ -25,8 +25,8 @@ namespace QSoundCloud {
 static const QString API_URL("https://api.soundcloud.com");
 
 // Authentication
-static const QString AUTH_URL("https://soundcloud.com/connect");
-static const QString TOKEN_URL("https://api.soundcloud.com/oauth2/token");
+static const QString AUTH_URL("https://secure.soundcloud.com/authorize");
+static const QString TOKEN_URL("https://secure.soundcloud.com/oauth/token");
 
 static const QString GRANT_TYPE_CLIENT("client_credentials");
 static const QString GRANT_TYPE_CODE("authorization_code");

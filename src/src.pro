@@ -11,6 +11,7 @@ DESTDIR = ../lib
 
 HEADERS += \
     authenticationrequest.h \
+    clientcredentials_p.h \
     json.h \
     model.h \
     model_p.h \
@@ -25,6 +26,7 @@ HEADERS += \
 
 SOURCES += \
     authenticationrequest.cpp \
+    clientcredentials.cpp \
     json.cpp \
     model.cpp \
     request.cpp \

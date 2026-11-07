@@ -15,6 +15,7 @@
  */
 
 #include "request_p.h"
+#include "clientcredentials_p.h"
 #include "urls.h"
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -533,17 +534,15 @@ void Request::head(bool authRequired) {
     }
     
     d->redirects = 0;
+    d->clientTokenRetried = false;
     d->setOperation(HeadOperation);
     d->setStatus(Loading);
-    
-    if (d->reply) {
-        delete d->reply;
-    }
 #ifdef QSOUNDCLOUD_DEBUG
     qDebug() << "QSoundCloud::Request::head" << d->url;
 #endif
-    d->reply = d->networkAccessManager()->head(d->buildRequest(authRequired));
-    connect(d->reply, SIGNAL(finished()), this, SLOT(_q_onReplyFinished()));
+    d->body.clear();
+    d->authRequired = authRequired;
+    d->sendRequest();
 }
 
 /*!
@@ -558,17 +557,15 @@ void Request::get(bool authRequired) {
     }
     
     d->redirects = 0;
+    d->clientTokenRetried = false;
     d->setOperation(GetOperation);
     d->setStatus(Loading);
-    
-    if (d->reply) {
-        delete d->reply;
-    }
 #ifdef QSOUNDCLOUD_DEBUG
     qDebug() << "QSoundCloud::Request::get" << d->url;
 #endif
-    d->reply = d->networkAccessManager()->get(d->buildRequest(authRequired));
-    connect(d->reply, SIGNAL(finished()), this, SLOT(_q_onReplyFinished()));
+    d->body.clear();
+    d->authRequired = authRequired;
+    d->sendRequest();
 }
 
 /*!
@@ -583,8 +580,9 @@ void Request::post(bool authRequired) {
     }
     
     d->redirects = 0;
+    d->clientTokenRetried = false;
     d->setOperation(PostOperation);
-    
+
     bool ok = true;
     QByteArray data;
     
@@ -602,13 +600,10 @@ void Request::post(bool authRequired) {
     qDebug() << "QSoundCloud::Request::post" << d->url << data;
 #endif
     if (ok) {
-        if (d->reply) {
-            delete d->reply;
-        }
-        
-        d->setStatus(Loading);        
-        d->reply = d->networkAccessManager()->post(d->buildRequest(authRequired), data);
-        connect(d->reply, SIGNAL(finished()), this, SLOT(_q_onReplyFinished()));
+        d->setStatus(Loading);
+        d->body = data;
+        d->authRequired = authRequired;
+        d->sendRequest();
     }
     else {
         d->setStatus(Failed);
@@ -630,8 +625,9 @@ void Request::put(bool authRequired) {
     }
     
     d->redirects = 0;
+    d->clientTokenRetried = false;
     d->setOperation(PutOperation);
-        
+
     bool ok = true;
     QByteArray data;
     
@@ -649,13 +645,10 @@ void Request::put(bool authRequired) {
     qDebug() << "QSoundCloud::Request::put" << d->url << data;
 #endif
     if (ok) {
-        if (d->reply) {
-            delete d->reply;
-        }
-        
-        d->setStatus(Loading);        
-        d->reply = d->networkAccessManager()->put(d->buildRequest(authRequired), data);
-        connect(d->reply, SIGNAL(finished()), this, SLOT(_q_onReplyFinished()));
+        d->setStatus(Loading);
+        d->body = data;
+        d->authRequired = authRequired;
+        d->sendRequest();
     }
     else {
         d->setStatus(Failed);
@@ -677,17 +670,15 @@ void Request::deleteResource(bool authRequired) {
     }
     
     d->redirects = 0;
+    d->clientTokenRetried = false;
     d->setOperation(DeleteOperation);
     d->setStatus(Loading);
-    
-    if (d->reply) {
-        delete d->reply;
-    }
 #ifdef QSOUNDCLOUD_DEBUG
     qDebug() << "QSoundCloud::Request::deleteResource" << d->url;
 #endif
-    d->reply = d->networkAccessManager()->deleteResource(d->buildRequest(authRequired));
-    connect(d->reply, SIGNAL(finished()), this, SLOT(_q_onReplyFinished()));
+    d->body.clear();
+    d->authRequired = authRequired;
+    d->sendRequest();
 }
 
 /*!
@@ -695,8 +686,16 @@ void Request::deleteResource(bool authRequired) {
 */
 void Request::cancel() {
     Q_D(Request);
-    
-    if (d->reply) {
+
+    if (d->waitingForClientToken) {
+        disconnect(ClientCredentials::instance(), SIGNAL(finished()), this, SLOT(_q_onClientTokenReady()));
+        d->waitingForClientToken = false;
+        d->setStatus(Canceled);
+        d->setError(NoError);
+        d->setErrorString(QString());
+        emit finished();
+    }
+    else if (d->reply) {
         d->reply->abort();
     }
 }
@@ -706,6 +705,9 @@ RequestPrivate::RequestPrivate(Request *parent) :
     manager(0),
     reply(0),
     ownNetworkAccessManager(false),
+    authRequired(true),
+    waitingForClientToken(false),
+    clientTokenRetried(false),
     operation(Request::UnknownOperation),
     status(Request::Null),
     error(Request::NoError),
@@ -780,12 +782,22 @@ QNetworkRequest RequestPrivate::buildRequest(QUrl u, bool authRequired) {
 
     // SoundCloud no longer accepts client_id/oauth_token query parameters. The token is sent in the Authorization
     // header, and only to SoundCloud hosts, so that it is not leaked when following a redirect elsewhere.
+    // Without a user access token, the app access token from the Client Credentials flow is used.
+    clientToken.clear();
+
     if (authRequired) {
         const QString host = u.host().toLower();
 
         if ((host == "soundcloud.com") || (host.endsWith(".soundcloud.com"))) {
             if (!accessToken.isEmpty()) {
                 request.setRawHeader("Authorization", "OAuth " + accessToken.toUtf8());
+            }
+            else {
+                clientToken = ClientCredentials::instance()->accessToken(clientId);
+
+                if (!clientToken.isEmpty()) {
+                    request.setRawHeader("Authorization", "OAuth " + clientToken.toUtf8());
+                }
             }
         }
     }
@@ -815,8 +827,86 @@ void RequestPrivate::followRedirect(const QUrl &redirect) {
         delete reply;
     }
         
-    reply = networkAccessManager()->get(buildRequest(redirect));
+    reply = networkAccessManager()->get(buildRequest(redirect, authRequired));
     Request::connect(reply, SIGNAL(finished()), q, SLOT(_q_onReplyFinished()));
+}
+
+void RequestPrivate::sendRequest() {
+    Q_Q(Request);
+
+    if (reply) {
+        delete reply;
+        reply = 0;
+    }
+
+    if ((authRequired) && (accessToken.isEmpty())
+        && (ClientCredentials::instance()->accessToken(clientId).isEmpty())) {
+        // The token request is shared: if one is already in progress, this just waits for it.
+        waitingForClientToken = true;
+        Request::connect(ClientCredentials::instance(), SIGNAL(finished()), q, SLOT(_q_onClientTokenReady()),
+                         Qt::UniqueConnection);
+        ClientCredentials::instance()->requestAccessToken(clientId, clientSecret);
+        return;
+    }
+
+    const QNetworkRequest request = buildRequest(authRequired);
+
+    switch (operation) {
+    case Request::HeadOperation:
+        reply = networkAccessManager()->head(request);
+        break;
+    case Request::PostOperation:
+        reply = networkAccessManager()->post(request, body);
+        break;
+    case Request::PutOperation:
+        reply = networkAccessManager()->put(request, body);
+        break;
+    case Request::DeleteOperation:
+        reply = networkAccessManager()->deleteResource(request);
+        break;
+    default:
+        reply = networkAccessManager()->get(request);
+        break;
+    }
+
+    Request::connect(reply, SIGNAL(finished()), q, SLOT(_q_onReplyFinished()));
+}
+
+bool RequestPrivate::retryWithNewClientToken() {
+    // Only retry once, and only if the rejected token was the app access token.
+    if ((clientTokenRetried) || (!accessToken.isEmpty()) || (clientToken.isEmpty())) {
+        return false;
+    }
+#ifdef QSOUNDCLOUD_DEBUG
+    qDebug() << "QSoundCloud::RequestPrivate::retryWithNewClientToken";
+#endif
+    clientTokenRetried = true;
+    redirects = 0;
+    ClientCredentials::instance()->invalidate(clientToken);
+    sendRequest();
+    return true;
+}
+
+void RequestPrivate::_q_onClientTokenReady() {
+    Q_Q(Request);
+
+    Request::disconnect(ClientCredentials::instance(), SIGNAL(finished()), q, SLOT(_q_onClientTokenReady()));
+
+    if (!waitingForClientToken) {
+        return;
+    }
+
+    waitingForClientToken = false;
+
+    if ((accessToken.isEmpty()) && (ClientCredentials::instance()->accessToken(clientId).isEmpty())) {
+        setStatus(Request::Failed);
+        setError(Request::AuthenticationRequiredError);
+        setErrorString(ClientCredentials::instance()->errorString());
+        emit q->finished();
+        return;
+    }
+
+    sendRequest();
 }
 
 void RequestPrivate::refreshAccessToken() {
@@ -946,16 +1036,16 @@ void RequestPrivate::_q_onReplyFinished() {
         emit q->finished();
         return;
     case QNetworkReply::AuthenticationRequiredError:
-        if (refreshToken.isEmpty()) {
+        if (!refreshToken.isEmpty()) {
+            refreshAccessToken();
+        }
+        else if (!retryWithNewClientToken()) {
             setStatus(Request::Failed);
             setError(Request::Error(e));
             setErrorString(es);
             emit q->finished();
         }
-        else {
-            refreshAccessToken();
-        }
-        
+
         return;
     default:
         setStatus(Request::Failed);

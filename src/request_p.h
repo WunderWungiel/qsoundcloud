@@ -203,10 +203,16 @@ public:
     virtual QNetworkRequest buildRequest(QUrl u, bool authRequired = true);
     
     virtual void followRedirect(const QUrl &redirect);
-    
+
+    // Sends the request for the current operation, first obtaining an app access token if one is needed.
+    void sendRequest();
+    // Called on a 401 response. Returns true if the request was resent with a new app access token.
+    bool retryWithNewClientToken();
+    void _q_onClientTokenReady();
+
     void refreshAccessToken();
     void _q_onAccessTokenRefreshed();
-        
+
     virtual void _q_onReplyFinished();
     
     Request *q_ptr;
@@ -221,13 +227,23 @@ public:
     QString clientSecret;
     QString accessToken;
     QString refreshToken;
-        
+
+    // The app access token (Client Credentials flow) sent with the last request, if any.
+    QString clientToken;
+
     QUrl url;
-    
+
     QVariantMap headers;
-    
+
     QVariant data;
-    
+
+    // The serialized data and authRequired of the current operation, kept so that it can be (re)sent later.
+    QByteArray body;
+    bool authRequired;
+
+    bool waitingForClientToken;
+    bool clientTokenRetried;
+
     QVariant result;
     
     Request::Operation operation;

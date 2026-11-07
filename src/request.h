@@ -171,6 +171,7 @@ protected:
     
     Q_DECLARE_PRIVATE(Request)
     
+    Q_PRIVATE_SLOT(d_func(), void _q_onClientTokenReady())
     Q_PRIVATE_SLOT(d_func(), void _q_onAccessTokenRefreshed())
     Q_PRIVATE_SLOT(d_func(), void _q_onReplyFinished())
     

@@ -51,105 +51,166 @@ public:
         RequestPrivate(parent)
     {
     }
-    
-    void getRedirect(const QUrl &u, const char *slot) {
-#ifdef QSOUNDCLOUD_DEBUG
-        qDebug() << "StreamsRequestPrivate::getRedirect" << u;
-#endif
+
+    // A stream whose API URL redirects to the media (or HLS playlist) URL, still to be resolved.
+    struct PendingStream {
+        PendingStream(const QString &i, const QString &d, const QString &e, const QString &p, const QUrl &u) :
+            id(i),
+            description(d),
+            ext(e),
+            protocol(p),
+            url(u)
+        {
+        }
+
+        QString id;
+        QString description;
+        QString ext;
+        QString protocol;
+        QUrl url;
+    };
+
+    void finish() {
         Q_Q(StreamsRequest);
-        
-        if (reply) {
-            delete reply;
-        }
-        
-        q->setUrl(u);
-        reply = networkAccessManager()->head(buildRequest());
-        StreamsRequest::connect(reply, SIGNAL(finished()), q, slot);
-    }
-    
-    void _q_onDownloadRedirect() {
-        if (!reply) {
-            return;
-        }
-        
-        if (reply->error() == QNetworkReply::NoError) {
-            QUrl redirect = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toString();
-            
-            if (redirect.isEmpty()) {
-                redirect = reply->header(QNetworkRequest::LocationHeader).toString();
-            }
-            
-            if (!redirect.isEmpty()) {
-                redirect.setScheme("http");
-                QString ext = track.value("original_format").toString();
-                formats << Format("original", QString("%1 (%2)").arg(StreamsRequest::tr("Original format")).arg(ext.toUpper()),
-                                  ext, redirect);
-            }
-        }
-        
-        reply->deleteLater();
-        reply = 0;
-            
-        if (track.value("streamable").toBool()) {
-            getRedirect(track.value("stream_url").toString(), SLOT(_q_onStreamRedirect()));
-        }
-        else {
-            Q_Q(StreamsRequest);
-            
-            setResult(formats);
-            setStatus(Request::Ready);
-            setError(Request::NoError);
-            setErrorString(QString());
-            
-            emit q->finished();
-        }
-    }
-    
-    void _q_onStreamRedirect() {        
-        if (!reply) {
-            return;
-        }
-        
-        Q_Q(StreamsRequest);
-        
-        if (reply->error() == QNetworkReply::NoError) {
-            QUrl redirect = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toString();
-            
-            if (redirect.isEmpty()) {
-                redirect = reply->header(QNetworkRequest::LocationHeader).toString();
-            }
-            
-            if (!redirect.isEmpty()) {
-                redirect.setScheme("http");
-                formats << Format("mp3", "128kb MP3", "mp3", redirect);
-            }
-        }
-        
-        reply->deleteLater();
-        reply = 0;
-                    
+
         setResult(formats);
         setStatus(Request::Ready);
         setError(Request::NoError);
         setErrorString(QString());
-        
+
         emit q->finished();
     }
-    
+
+    // Resolves the next pending stream, or finishes when there is none left.
+    void resolveNextStream() {
+        Q_Q(StreamsRequest);
+
+        if (reply) {
+            reply->deleteLater();
+            reply = 0;
+        }
+
+        if (pending.isEmpty()) {
+            finish();
+            return;
+        }
+
+#ifdef QSOUNDCLOUD_DEBUG
+        qDebug() << "StreamsRequestPrivate::resolveNextStream" << pending.first().url;
+#endif
+        q->setUrl(pending.first().url);
+        reply = networkAccessManager()->head(buildRequest());
+        StreamsRequest::connect(reply, SIGNAL(finished()), q, SLOT(_q_onStreamRedirect()));
+    }
+
+    // Returns true, after finishing the request as canceled, if the current reply was canceled.
+    bool checkCanceled() {
+        if (reply->error() != QNetworkReply::OperationCanceledError) {
+            return false;
+        }
+
+        Q_Q(StreamsRequest);
+
+        reply->deleteLater();
+        reply = 0;
+        pending.clear();
+        setStatus(Request::Canceled);
+        setError(Request::NoError);
+        setErrorString(QString());
+        emit q->finished();
+        return true;
+    }
+
+    void _q_onStreamRedirect() {
+        if ((!reply) || (pending.isEmpty()) || (checkCanceled())) {
+            return;
+        }
+
+        const PendingStream stream = pending.takeFirst();
+
+        if (reply->error() == QNetworkReply::NoError) {
+            QUrl redirect = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toString();
+
+            if (redirect.isEmpty()) {
+                redirect = reply->header(QNetworkRequest::LocationHeader).toString();
+            }
+
+            if (!redirect.isEmpty()) {
+                if (stream.protocol == "http") {
+                    // Media players on older platforms cannot play HTTPS streams.
+                    redirect.setScheme("http");
+                }
+
+                Format format(stream.id, stream.description, stream.ext, redirect);
+                format.insert("protocol", stream.protocol);
+                formats << format;
+            }
+        }
+#ifdef QSOUNDCLOUD_DEBUG
+        else {
+            qDebug() << "StreamsRequestPrivate::_q_onStreamRedirect" << reply->errorString();
+        }
+#endif
+        resolveNextStream();
+    }
+
+    // Requests the track's transcodings. SoundCloud no longer serves full length tracks from stream_url (it
+    // redirects to a 30 second preview), and most tracks are now only available as HLS.
+    void getStreams() {
+        Q_Q(StreamsRequest);
+
+        // Prefer the URN, as large numeric ids may not survive JSON number parsing.
+        const QString id = track.contains("urn") ? track.value("urn").toString() : track.value("id").toString();
+        q->setUrl(API_URL + "/tracks/" + id + "/streams");
+        reply = networkAccessManager()->get(buildRequest());
+        StreamsRequest::connect(reply, SIGNAL(finished()), q, SLOT(_q_onStreamsListFinished()));
+    }
+
+    void _q_onStreamsListFinished() {
+        if ((!reply) || (checkCanceled())) {
+            return;
+        }
+
+        const QString response = QString::fromUtf8(reply->readAll());
+        const QNetworkReply::NetworkError e = reply->error();
+        bool ok = (e == QNetworkReply::NoError);
+        const QVariantMap streams = ok ? QtJson::Json::parse(response, ok).toMap() : QVariantMap();
+#ifdef QSOUNDCLOUD_DEBUG
+        qDebug() << "StreamsRequestPrivate::_q_onStreamsListFinished" << e << response;
+#endif
+        if (streams.contains("http_mp3_128_url")) {
+            pending << PendingStream("mp3", "128kb MP3", "mp3", "http", streams.value("http_mp3_128_url").toString());
+        }
+        else if (streams.contains("hls_mp3_128_url")) {
+            // Same id and description as the progressive stream, so that saved playback/download formats match.
+            pending << PendingStream("mp3", "128kb MP3", "mp3", "hls", streams.value("hls_mp3_128_url").toString());
+        }
+        else if (streams.contains("preview_mp3_128_url")) {
+            pending << PendingStream("preview", StreamsRequest::tr("30 second preview (MP3)"), "mp3", "http",
+                                     streams.value("preview_mp3_128_url").toString());
+        }
+        else if ((!ok) && (track.value("streamable").toBool())) {
+            // The transcodings could not be requested, so fall back to the legacy stream URL.
+            pending << PendingStream("mp3", "128kb MP3", "mp3", "http", track.value("stream_url").toString());
+        }
+
+        resolveNextStream();
+    }
+
     void _q_onReplyFinished() {
         if (!reply) {
             return;
         }
-    
+
         Q_Q(StreamsRequest);
-        
+
         if (redirects < MAX_REDIRECTS) {
             QUrl redirect = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toString();
-    
+
             if (redirect.isEmpty()) {
                 redirect = reply->header(QNetworkRequest::LocationHeader).toString();
             }
-    
+
             if (!redirect.isEmpty()) {
                 reply->deleteLater();
                 reply = 0;
@@ -157,13 +218,13 @@ public:
                 return;
             }
         }
-        
+
         const QString response = QString::fromUtf8(reply->readAll());
         const QNetworkReply::NetworkError e = reply->error();
         const QString es = reply->errorString();
         reply->deleteLater();
         reply = 0;
-        
+
         switch (e) {
         case QNetworkReply::NoError:
             break;
@@ -183,7 +244,7 @@ public:
                 setErrorString(es);
                 emit q->finished();
             }
-        
+
             return;
         default:
             setStatus(Request::Failed);
@@ -192,39 +253,39 @@ public:
             emit q->finished();
             return;
         }
-        
+
         bool ok = true;
         track = QtJson::Json::parse(response, ok).toMap();
         formats.clear();
-        
+        pending.clear();
+
         if (ok) {
             if (track.value("downloadable").toBool()) {
-                getRedirect(track.value("download_url").toString(), SLOT(_q_onDownloadRedirect()));
-                return;
+                const QString ext = track.value("original_format").toString();
+                pending << PendingStream("original", QString("%1 (%2)").arg(StreamsRequest::tr("Original format"))
+                                         .arg(ext.toUpper()), ext, "http", track.value("download_url").toString());
             }
-            
+
             if (track.value("streamable").toBool()) {
-                getRedirect(track.value("stream_url").toString(), SLOT(_q_onStreamRedirect()));
-                return;
+                getStreams();
             }
-            
-            setResult(formats);
-            setStatus(Request::Ready);
-            setError(Request::NoError);
-            setErrorString(QString());
-        }
-        else {
-            setStatus(Request::Failed);
-            setError(Request::ParseError);
-            setErrorString(Request::tr("Unable to parse response"));
+            else {
+                resolveNextStream();
+            }
+
+            return;
         }
 
+        setStatus(Request::Failed);
+        setError(Request::ParseError);
+        setErrorString(Request::tr("Unable to parse response"));
         emit q->finished();
     }
-    
+
     QVariantList formats;
     QVariantMap track;
-                    
+    QList<PendingStream> pending;
+
     Q_DECLARE_PUBLIC(StreamsRequest)
 };
 

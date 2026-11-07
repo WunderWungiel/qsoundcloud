@@ -37,7 +37,7 @@ private:
     Q_DECLARE_PRIVATE(StreamsRequest)
     Q_DISABLE_COPY(StreamsRequest)
     
-    Q_PRIVATE_SLOT(d_func(), void _q_onDownloadRedirect())
+    Q_PRIVATE_SLOT(d_func(), void _q_onStreamsListFinished())
     Q_PRIVATE_SLOT(d_func(), void _q_onStreamRedirect())
 };
 

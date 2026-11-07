@@ -776,34 +776,20 @@ QNetworkRequest RequestPrivate::buildRequest(QUrl u, bool authRequired) {
 #ifdef QSOUNDCLOUD_DEBUG
     qDebug() << "QSoundCloud::RequestPrivate::buildRequest " << u;
 #endif
-    if (authRequired) {
-#if QT_VERSION >= 0x050000
-        QUrlQuery query(u);
-        
-        if (!query.hasQueryItem("client_id")) {
-            if (!accessToken.isEmpty()) {
-                query.addQueryItem("oauth_token", accessToken);
-            }
-            else {
-                query.addQueryItem("client_id", clientId);
-            }
-            
-            u.setQuery(query);
-        }
-#else   
-        if (!u.hasQueryItem("client_id")) {
-            if (!accessToken.isEmpty()) {
-                u.addQueryItem("oauth_token", accessToken);
-            }
-            else {
-                u.addQueryItem("client_id", clientId);
-            }
-        }
-#endif
-    }
-    
     QNetworkRequest request(u);
-    
+
+    // SoundCloud no longer accepts client_id/oauth_token query parameters. The token is sent in the Authorization
+    // header, and only to SoundCloud hosts, so that it is not leaked when following a redirect elsewhere.
+    if (authRequired) {
+        const QString host = u.host().toLower();
+
+        if ((host == "soundcloud.com") || (host.endsWith(".soundcloud.com"))) {
+            if (!accessToken.isEmpty()) {
+                request.setRawHeader("Authorization", "OAuth " + accessToken.toUtf8());
+            }
+        }
+    }
+
     switch (operation) {
     case Request::PostOperation:
     case Request::PutOperation:
